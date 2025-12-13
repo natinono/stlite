@@ -21,7 +21,7 @@
             "pyodide-http",
             "requests",
             "xlrd",
-            "pyyaml"  // 修正: これでエラーが出なくなります
+            "pyyaml"
           ],
           entrypoint: "streamlit_app.py",
           files: {
@@ -35,17 +35,10 @@ import sys
 
 st.set_page_config(page_title="投資管理App", layout="wide")
 
-st.write("### 投資管理アプリ (Stlite版)")
-st.info("👈 左側のサイドバーにある **'投資履歴'** ページに移動して、Excelファイルをアップロードしてください。")
+st.write("### 投資管理アプリ (GitHub Pages版)")
+st.info("リポジトリ内の Excel データを自動で読み込んでいます。")
+st.markdown("👈 サイドバーの **'投資履歴'** ページをご覧ください。")
 
-st.markdown("""
-#### 使い方
-1. 左のサイドバーを開く
-2. **1_投資履歴** をクリック
-3. サイドバーの上部に表示される **'Browse files'** ボタンから **toshin_buy.xlsx** を選択
-""")
-
-st.write('---')
 st.caption(f'System Info: Python {sys.version} / Streamlit {st.__version__}')
 `,
             "pages/1_投資履歴.py": `
@@ -60,14 +53,43 @@ import yaml
 import io
 import requests
 import plotly.graph_objs as go
+import os
 
-# --- Stlite用のネットワークパッチ ---
+# --- Stlite用のネットワークパッチ (必須) ---
 import pyodide_http
 pyodide_http.patch_all()
-# ---------------------------------
+# ----------------------------------------
 
 JST = datetime.timezone(timedelta(hours=+9), 'JST')
 
+# ==========================================
+# ファイル取得・保存関数 (GitHub Pages用)
+# ==========================================
+def load_remote_file(filename):
+    """
+    同じディレクトリ(URL)にあるファイルをダウンロードし、
+    Stliteの仮想ファイルシステムに保存する
+    """
+    if os.path.exists(filename):
+        return True # すでに存在すれば何もしない
+
+    url = f"./{filename}" # 相対パスで自分自身から取得
+    try:
+        response = requests.get(url)
+        response.raise_for_status() # 404などのエラーチェック
+        
+        # バイナリとして保存
+        with open(filename, 'wb') as f:
+            f.write(response.content)
+        return True
+    except Exception as e:
+        # 必須でないファイルもあるため、ここはログ出力にとどめる
+        # st.warning(f"{filename} の取得に失敗しました: {e}") 
+        return False
+
+# ==========================================
+# ロジック関数群
+# ==========================================
 def get_growth(year, df_buy_hyouka):
     if datetime.date.today().year == year:
         end_date = datetime.date.today()
@@ -77,10 +99,8 @@ def get_growth(year, df_buy_hyouka):
     end_date_str = end_date.strftime('%Y-%m-%d')
     prev_end_date_str = datetime.date(year=(year-1),month=12,day=31).strftime('%Y-%m-%d')
 
-    # データが存在するかチェック
     if end_date_str not in df_buy_hyouka.index:
         if not df_buy_hyouka.empty:
-            # データ期間外なら最新の日付を使うなどの調整
             if pd.to_datetime(end_date_str) > df_buy_hyouka.index[-1]:
                  end_date_str = df_buy_hyouka.index[-1].strftime('%Y-%m-%d')
             else:
@@ -89,7 +109,6 @@ def get_growth(year, df_buy_hyouka):
             return 0,0,0,0,0
     
     if prev_end_date_str not in df_buy_hyouka.index:
-         # 前年のデータがない場合
          return 0,0,0,0,0
 
     this_year_end_value = df_buy_hyouka['評価額'].loc[end_date_str]
@@ -131,15 +150,18 @@ def get_kagaku(fund_dict):
     if not kagaku_df.empty:
         kagaku_df = kagaku_df[kagaku_df.index >= '2019-01-01']
 
-    # 過去データ(xlsx)の読み込み
-    # kagaku.xlsx がない場合は、直近データのみで動くようにする
-    try:
-        kagaku_df_past = pd.read_excel('kagaku.xlsx')
-        kagaku_df_past = kagaku_df_past.set_index('日付',drop=True)
-        kagaku_df_past = kagaku_df_past[kagaku_df_past.index < '2019-01-01']
-        df_kagaku = pd.concat([kagaku_df_past,kagaku_df])
-    except Exception:
-        # ファイルがない、または読み込めない場合はWeb取得分のみ使用
+    # --- 変更点: kagaku.xlsx をGitHubから取得して読み込み ---
+    has_kagaku_file = load_remote_file('kagaku.xlsx')
+    
+    if has_kagaku_file:
+        try:
+            kagaku_df_past = pd.read_excel('kagaku.xlsx')
+            kagaku_df_past = kagaku_df_past.set_index('日付',drop=True)
+            kagaku_df_past = kagaku_df_past[kagaku_df_past.index < '2019-01-01']
+            df_kagaku = pd.concat([kagaku_df_past,kagaku_df])
+        except Exception:
+            df_kagaku = kagaku_df
+    else:
         df_kagaku = kagaku_df
 
     return df_kagaku
@@ -148,59 +170,55 @@ def get_kagaku(fund_dict):
 # メイン処理
 # ==========================================
 
-# 1. サイドバー設定 (最優先で配置)
-st.sidebar.header("📁 データ入力")
-uploaded_file = st.sidebar.file_uploader("toshin_buy.xlsx をアップロード", type=['xlsx'])
+# 1. 自動データ読み込み処理
+with st.sidebar:
+    st.header("⚙️ 設定")
+    
+    # リポジトリからファイルをダウンロードして仮想環境に配置
+    with st.spinner('GitHubからデータを読み込んでいます...'):
+        load_success = load_remote_file('toshin_buy.xlsx')
 
-st.sidebar.markdown("---")
-st.sidebar.header("⚙️ シミュレーション設定")
-
-predict_period = st.sidebar.slider("予測期間(年)", 0, 30, 0, 1)
-
-# 初期値設定
-kokunai_kongo      = 0
-senshinkoku_kongo  = 0
-balance_kongo      = 0
-zensekai_kongo     = 150000
-beikoku_kongo      = 0
-
-dict_growth = {
-    "国内株式"     : 5,
-    "先進国株式"   : 5,
-    "全世界株式"   : 5,
-    "米国株式"   : 5,
-    "バランス"   : 3,
-}
-
-st.sidebar.subheader("投資額設定")
-senshinkoku_kongo=st.sidebar.slider("投資額_先進国株式", 0, 40, int(senshinkoku_kongo/10000), 1)*10000
-zensekai_kongo=st.sidebar.slider("投資額_全世界株式", 0, 40, int(zensekai_kongo/10000), 1)*10000
-beikoku_kongo=st.sidebar.slider("投資額_米国株式", 0, 40, int(beikoku_kongo/10000), 1)*10000
-kokunai_kongo=st.sidebar.slider("投資額_国内株式", 0, 40, int(kokunai_kongo/10000), 1)*10000
-balance_kongo=st.sidebar.slider("投資額_バランス", 0, 40, int(balance_kongo/10000), 1)*10000
-
-st.sidebar.subheader("年利設定")
-dict_growth['先進国株式']=st.sidebar.slider("年利_先進国株式", 0, 20, dict_growth['先進国株式'], 1)
-dict_growth['全世界株式']=st.sidebar.slider("年利_全世界株式", 0, 20, dict_growth['全世界株式'], 1)
-dict_growth['米国株式']=st.sidebar.slider("年利_米国株式", 0, 20, dict_growth['米国株式'], 1)
-dict_growth['国内株式']=st.sidebar.slider("年利_国内株式", 0, 20, dict_growth['国内株式'], 1)
-dict_growth['バランス']=st.sidebar.slider("年利_バランス", 0, 20, dict_growth['バランス'], 1)
-
-
-# 2. ファイル読み込み処理
-buy_xlsx = None
-if uploaded_file is not None:
-    try:
-        buy_xlsx = pd.read_excel(uploaded_file)
-        st.sidebar.success("✅ ファイル読み込み成功")
-    except Exception as e:
-        st.error(f"ファイル読み込みエラー: {e}")
+    if load_success:
+        st.success("✅ データ読み込み完了")
+    else:
+        st.error("❌ toshin_buy.xlsx が見つかりません")
+        st.info("index.htmlと同じ場所にファイルを配置してください。")
         st.stop()
-else:
-    st.info("👈 左のサイドバーから 'toshin_buy.xlsx' をアップロードしてください。")
-    st.stop() # ファイルがない場合はここで処理を止める
 
-# 3. データの取得と計算
+    st.markdown("---")
+    predict_period = st.slider("予測期間(年)", 0, 30, 0, 1)
+
+    # 初期値設定
+    kokunai_kongo      = 0
+    senshinkoku_kongo  = 0
+    balance_kongo      = 0
+    zensekai_kongo     = 150000
+    beikoku_kongo      = 0
+
+    dict_growth = {
+        "国内株式"     : 5,
+        "先進国株式"   : 5,
+        "全世界株式"   : 5,
+        "米国株式"   : 5,
+        "バランス"   : 3,
+    }
+
+    st.subheader("投資額設定")
+    senshinkoku_kongo=st.slider("投資額_先進国株式", 0, 40, int(senshinkoku_kongo/10000), 1)*10000
+    zensekai_kongo=st.slider("投資額_全世界株式", 0, 40, int(zensekai_kongo/10000), 1)*10000
+    beikoku_kongo=st.slider("投資額_米国株式", 0, 40, int(beikoku_kongo/10000), 1)*10000
+    kokunai_kongo=st.slider("投資額_国内株式", 0, 40, int(kokunai_kongo/10000), 1)*10000
+    balance_kongo=st.slider("投資額_バランス", 0, 40, int(balance_kongo/10000), 1)*10000
+
+    st.subheader("年利設定")
+    dict_growth['先進国株式']=st.slider("年利_先進国株式", 0, 20, dict_growth['先進国株式'], 1)
+    dict_growth['全世界株式']=st.slider("年利_全世界株式", 0, 20, dict_growth['全世界株式'], 1)
+    dict_growth['米国株式']=st.slider("年利_米国株式", 0, 20, dict_growth['米国株式'], 1)
+    dict_growth['国内株式']=st.slider("年利_国内株式", 0, 20, dict_growth['国内株式'], 1)
+    dict_growth['バランス']=st.slider("年利_バランス", 0, 20, dict_growth['バランス'], 1)
+
+
+# 2. メインロジック
 str_date = "2017-01-01"
 future_date = str(datetime.date.today() + datetime.timedelta(days=365*predict_period))
 today = datetime.datetime.today()
@@ -213,11 +231,10 @@ fund_dict = {
 'バランス':   'https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download?isinCd=JP90C000EWV6&associFundCd=03312175',
 }
 
-with st.spinner('最新の基準価額を取得中...'):
-    df_kagaku = get_kagaku(fund_dict)
+df_kagaku = get_kagaku(fund_dict)
 
 if df_kagaku.empty:
-    st.error("基準価額データが取得できませんでした。ネットワーク環境またはCORS制限を確認してください。")
+    st.error("基準価額データが取得できませんでした。")
     st.stop()
 
 leatest_date = df_kagaku.index.max()
@@ -231,7 +248,6 @@ df_kagaku = df_kagaku.set_index('日付', drop=True)
 df_mirai = pd.DataFrame(index = pd.date_range(df_kagaku.index[len(df_kagaku)-1], future_date , freq='MS'),columns= df_kagaku.columns)
 df_kagaku = pd.concat([df_kagaku,df_mirai]).groupby(level=0).last()
 
-# 将来予測の計算
 for i in range(0,len(df_kagaku)):
     val = float(df_kagaku.iloc[i]['国内株式']) if pd.notna(df_kagaku.iloc[i]['国内株式']) else -1.0
     if val >= 0.0:
@@ -251,11 +267,14 @@ else:
      if not df_kagaku_hiritu.empty:
         df_kagaku_hiritu = df_kagaku_hiritu / df_kagaku_hiritu.iloc[0] * 100
 
-# 4. 購入履歴データの結合処理
+# 3. ファイルからのデータ読み込み処理
 df_buy = pd.DataFrame()
-if buy_xlsx is not None and not buy_xlsx.empty:
+
+# load_remote_fileですでにローカル(仮想)に保存されているはず
+try:
+    buy_xlsx = pd.read_excel('toshin_buy.xlsx')
+    
     for index, data in buy_xlsx.iterrows():
-        # データ型変換や欠損値処理
         if '年月日' in data and 'アセット' in data and '価格' in data:
             target_date = data['年月日']
             target_asset = data['アセット']
@@ -271,7 +290,6 @@ if buy_xlsx is not None and not buy_xlsx.empty:
 
     df_buy=df_buy.rename_axis('年月日')
     df_buy = df_buy.sort_index()
-    
     df_buy.index = pd.to_datetime(df_buy.index)
 
     # 将来分の積立設定
@@ -311,7 +329,6 @@ if buy_xlsx is not None and not buy_xlsx.empty:
     df_buy_hyouka['税引き前利益'] = df_buy_hyouka['評価額'] - df_buy_hyouka['購入額']
     df_buy_hyouka['税引き後利益'] = df_buy_hyouka['税引き前利益'] * 0.8
 
-    # 表示用関数
     def date_judge(date):
         today_now = datetime.datetime.now()
         delta_days = (today_now - date).days
@@ -331,9 +348,8 @@ if buy_xlsx is not None and not buy_xlsx.empty:
             }).set_index('最新基準価額')
             st.table(display_table)
         except Exception:
-            st.warning("最新日付のデータ計算中にエラーが発生しました。")
+            pass
 
-        # グラフ描画
         margin = dict(t=30, b=20, l=20, r=20)
         
         col1, col2 = st.columns([1, 2])
@@ -357,7 +373,6 @@ if buy_xlsx is not None and not buy_xlsx.empty:
         fig2.update_layout(margin=margin, width=800, height=400)
         st.plotly_chart(fig2, use_container_width=True)
 
-        # 月次利益
         monthly_profit = df_buy_hyouka.groupby(pd.Grouper(freq='M'))['税引き後利益'].agg('last')
         shifted_monthly_profit = monthly_profit.shift(1)
         monthly_profit_diff = monthly_profit - shifted_monthly_profit
@@ -383,7 +398,6 @@ if buy_xlsx is not None and not buy_xlsx.empty:
         fig6= go.Figure(data = [trace1,trace2,trace3],layout=layout)
         st.plotly_chart(fig6, use_container_width=True)
 
-        # 年利計算
         year_list = []
         this_year_end_value_list = []
         previous_year_end_value_list = []
@@ -405,6 +419,10 @@ if buy_xlsx is not None and not buy_xlsx.empty:
             growth_df = pd.DataFrame(list(zip(year_list,previous_year_end_value_list,this_year_end_value_list,buy_this_year_list,profit_list,growth_list)),columns = ['年','年始評価額','年末評価額','購入額','利益','年利(%)'])
             growth_df = growth_df.set_index('年')
             st.dataframe(growth_df)
+
+except Exception as e:
+    st.error(f"データ処理中にエラーが発生しました: {e}")
+
 `,
           },
         },
