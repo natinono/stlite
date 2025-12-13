@@ -27,19 +27,11 @@
           files: {
             "streamlit_app.py": `
 import streamlit as st
-import numpy
-import openpyxl
-import pandas
-import plotly
 import sys
 
 st.set_page_config(page_title="投資管理App", layout="wide")
-
 st.write("### 投資管理アプリ (GitHub Pages版)")
-st.info("リポジトリ内の Excel データを自動で読み込んでいます。")
-st.markdown("👈 サイドバーの **'投資履歴'** ページをご覧ください。")
-
-st.caption(f'System Info: Python {sys.version} / Streamlit {st.__version__}')
+st.info("👈 サイドバーの **'投資履歴'** ページを開いてください。")
 `,
             "pages/1_投資履歴.py": `
 import pandas as pd
@@ -47,7 +39,6 @@ import datetime
 from datetime import timedelta
 import streamlit as st
 import plotly.express as px
-from pandas.core.dtypes.inference import is_number
 import base64
 import yaml
 import io
@@ -55,40 +46,53 @@ import requests
 import plotly.graph_objs as go
 import os
 
-# --- Stlite用のネットワークパッチ (必須) ---
+# --- ネットワーク通信の有効化 (必須) ---
 import pyodide_http
 pyodide_http.patch_all()
-# ----------------------------------------
+# -----------------------------------
 
 JST = datetime.timezone(timedelta(hours=+9), 'JST')
 
 # ==========================================
-# ファイル取得・保存関数 (GitHub Pages用)
+# ファイル取得関数 (デバッグ機能強化版)
 # ==========================================
 def load_remote_file(filename):
     """
-    同じディレクトリ(URL)にあるファイルをダウンロードし、
-    Stliteの仮想ファイルシステムに保存する
+    ファイルをダウンロードし、保存する。失敗した場合は詳細なエラーを表示する。
     """
     if os.path.exists(filename):
-        return True # すでに存在すれば何もしない
-
-    url = f"./{filename}" # 相対パスで自分自身から取得
-    try:
-        response = requests.get(url)
-        response.raise_for_status() # 404などのエラーチェック
-        
-        # バイナリとして保存
-        with open(filename, 'wb') as f:
-            f.write(response.content)
         return True
-    except Exception as e:
-        # 必須でないファイルもあるため、ここはログ出力にとどめる
-        # st.warning(f"{filename} の取得に失敗しました: {e}") 
-        return False
+
+    # 試行するURLリスト (相対パスと絶対パスっぽいやつ)
+    # GitHub Pagesのルート直下に置かれていると仮定
+    urls_to_try = [filename, f"./{filename}"]
+    
+    last_error = None
+    
+    for url in urls_to_try:
+        try:
+            # st.write(f"Trying to fetch: {url} ...") # デバッグ用ログ
+            response = requests.get(url)
+            
+            if response.status_code == 200:
+                with open(filename, 'wb') as f:
+                    f.write(response.content)
+                return True
+            else:
+                last_error = f"HTTP Status: {response.status_code} (URL: {url})"
+        except Exception as e:
+            last_error = f"Error: {e} (URL: {url})"
+            
+    # 全てのURLで失敗した場合、エラーを表示
+    if last_error:
+        st.error(f"❌ ファイル取得失敗: {filename}")
+        st.error(f"詳細: {last_error}")
+        st.warning("ヒント: ファイル名の大文字・小文字が合っているか、GitHub Pagesの公開設定が完了しているか確認してください。")
+        
+    return False
 
 # ==========================================
-# ロジック関数群
+# ロジック関数群 (変更なし)
 # ==========================================
 def get_growth(year, df_buy_hyouka):
     if datetime.date.today().year == year:
@@ -130,18 +134,14 @@ def get_growth(year, df_buy_hyouka):
 
 @st.cache_data(ttl=600)
 def get_kagaku(fund_dict):
-    # emaxisから最新の基準価額を取得
     kagaku_df = pd.DataFrame()
-    
     for key, value in fund_dict.items():
         try:
-            # 投信協会からDL
             df = pd.read_csv(value, encoding='cp932', skiprows=0)
             df = df.rename(columns={'年月日': '日付'})
             df['日付'] = pd.to_datetime(df['日付'], format='%Y年%m月%d日')
             df = df.set_index('日付')
             df = df.iloc[:,0:1]
-
             df.columns = [key]
             kagaku_df = pd.concat([kagaku_df,df],axis=1)
         except Exception as e:
@@ -150,10 +150,10 @@ def get_kagaku(fund_dict):
     if not kagaku_df.empty:
         kagaku_df = kagaku_df[kagaku_df.index >= '2019-01-01']
 
-    # --- 変更点: kagaku.xlsx をGitHubから取得して読み込み ---
-    has_kagaku_file = load_remote_file('kagaku.xlsx')
+    # kagaku.xlsx の読み込み試行
+    load_remote_file('kagaku.xlsx')
     
-    if has_kagaku_file:
+    if os.path.exists('kagaku.xlsx'):
         try:
             kagaku_df_past = pd.read_excel('kagaku.xlsx')
             kagaku_df_past = kagaku_df_past.set_index('日付',drop=True)
@@ -172,17 +172,16 @@ def get_kagaku(fund_dict):
 
 # 1. 自動データ読み込み処理
 with st.sidebar:
-    st.header("⚙️ 設定")
+    st.header("⚙️ データ読み込み状況")
     
-    # リポジトリからファイルをダウンロードして仮想環境に配置
-    with st.spinner('GitHubからデータを読み込んでいます...'):
+    # 読み込み実行
+    with st.spinner('GitHubからデータを取得中...'):
         load_success = load_remote_file('toshin_buy.xlsx')
 
     if load_success:
-        st.success("✅ データ読み込み完了")
+        st.success("✅ toshin_buy.xlsx 取得成功")
     else:
-        st.error("❌ toshin_buy.xlsx が見つかりません")
-        st.info("index.htmlと同じ場所にファイルを配置してください。")
+        # ここで処理を停止させる
         st.stop()
 
     st.markdown("---")
@@ -270,7 +269,6 @@ else:
 # 3. ファイルからのデータ読み込み処理
 df_buy = pd.DataFrame()
 
-# load_remote_fileですでにローカル(仮想)に保存されているはず
 try:
     buy_xlsx = pd.read_excel('toshin_buy.xlsx')
     
