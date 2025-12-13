@@ -32,6 +32,7 @@ import sys
 st.set_page_config(page_title="投資管理App", layout="wide")
 st.write("### 投資管理アプリ (GitHub Pages版)")
 st.info("👈 サイドバーの **'投資履歴'** ページを開いてください。")
+st.caption("※Excelファイルはリポジトリ(index.htmlと同じ場所)から自動で読み込まれます。")
 `,
             "pages/1_投資履歴.py": `
 import pandas as pd
@@ -56,19 +57,23 @@ pyodide_http.patch_all()
 JST = datetime.timezone(timedelta(hours=+9), 'JST')
 
 # ==========================================
-# ファイル取得関数 (URL自動生成・修正版)
+# ファイル取得関数 (Worker対応版)
 # ==========================================
 def load_remote_file(filename):
     """
-    相対パスではなく、ブラウザの現在地から絶対URLを生成してファイルを取得する
+    ブラウザの現在地から絶対URLを生成してファイルを取得する (Web Worker対応)
     """
     if os.path.exists(filename):
         return True
 
-    # 1. ブラウザの現在のURLを取得 (例: https://user.github.io/repo/index.html)
-    current_location = str(js.window.location.href)
+    try:
+        # 【修正】Worker環境では window ではなく location を直接参照する
+        current_location = str(js.location.href)
+    except Exception:
+        # 万が一取得できない場合は空文字
+        current_location = ""
 
-    # 2. ベースURLを整形 (index.html やパラメータを除去)
+    # ベースURLを整形 (index.html やパラメータを除去)
     if "?" in current_location:
         current_location = current_location.split("?")[0]
     if "#" in current_location:
@@ -81,7 +86,7 @@ def load_remote_file(filename):
     else:
         base_url = current_location
 
-    # 3. 完全なURLを作成 (例: https://user.github.io/repo/toshin_buy.xlsx)
+    # 完全なURLを作成 (例: https://user.github.io/repo/toshin_buy.xlsx)
     target_url = urljoin(base_url, filename)
 
     try:
@@ -103,7 +108,7 @@ def load_remote_file(filename):
         return False
 
 # ==========================================
-# ロジック関数群 (変更なし)
+# ロジック関数群
 # ==========================================
 def get_growth(year, df_buy_hyouka):
     if datetime.date.today().year == year:
