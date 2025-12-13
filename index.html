@@ -45,51 +45,62 @@ import io
 import requests
 import plotly.graph_objs as go
 import os
+import js # Javascript連携用
+from urllib.parse import urljoin
 
-# --- ネットワーク通信の有効化 (必須) ---
+# --- ネットワーク通信の有効化 ---
 import pyodide_http
 pyodide_http.patch_all()
-# -----------------------------------
+# ---------------------------
 
 JST = datetime.timezone(timedelta(hours=+9), 'JST')
 
 # ==========================================
-# ファイル取得関数 (デバッグ機能強化版)
+# ファイル取得関数 (URL自動生成・修正版)
 # ==========================================
 def load_remote_file(filename):
     """
-    ファイルをダウンロードし、保存する。失敗した場合は詳細なエラーを表示する。
+    相対パスではなく、ブラウザの現在地から絶対URLを生成してファイルを取得する
     """
     if os.path.exists(filename):
         return True
 
-    # 試行するURLリスト (相対パスと絶対パスっぽいやつ)
-    # GitHub Pagesのルート直下に置かれていると仮定
-    urls_to_try = [filename, f"./{filename}"]
+    # 1. ブラウザの現在のURLを取得 (例: https://user.github.io/repo/index.html)
+    current_location = str(js.window.location.href)
+
+    # 2. ベースURLを整形 (index.html やパラメータを除去)
+    if "?" in current_location:
+        current_location = current_location.split("?")[0]
+    if "#" in current_location:
+        current_location = current_location.split("#")[0]
     
-    last_error = None
-    
-    for url in urls_to_try:
-        try:
-            # st.write(f"Trying to fetch: {url} ...") # デバッグ用ログ
-            response = requests.get(url)
-            
-            if response.status_code == 200:
-                with open(filename, 'wb') as f:
-                    f.write(response.content)
-                return True
-            else:
-                last_error = f"HTTP Status: {response.status_code} (URL: {url})"
-        except Exception as e:
-            last_error = f"Error: {e} (URL: {url})"
-            
-    # 全てのURLで失敗した場合、エラーを表示
-    if last_error:
-        st.error(f"❌ ファイル取得失敗: {filename}")
-        st.error(f"詳細: {last_error}")
-        st.warning("ヒント: ファイル名の大文字・小文字が合っているか、GitHub Pagesの公開設定が完了しているか確認してください。")
+    if current_location.lower().endswith("index.html"):
+        base_url = current_location[:-10] # "index.html" を削除
+    elif not current_location.endswith("/"):
+        base_url = current_location + "/"
+    else:
+        base_url = current_location
+
+    # 3. 完全なURLを作成 (例: https://user.github.io/repo/toshin_buy.xlsx)
+    target_url = urljoin(base_url, filename)
+
+    try:
+        # st.write(f"取得先URL: {target_url}") # デバッグ用
+        response = requests.get(target_url)
         
-    return False
+        if response.status_code == 200:
+            with open(filename, 'wb') as f:
+                f.write(response.content)
+            return True
+        else:
+            st.error(f"❌ ファイルが見つかりません (Status: {response.status_code})")
+            st.error(f"参照先URL: {target_url}")
+            return False
+            
+    except Exception as e:
+        st.error(f"❌ 通信エラー: {e}")
+        st.write(f"Target URL: {target_url}")
+        return False
 
 # ==========================================
 # ロジック関数群 (変更なし)
@@ -170,18 +181,16 @@ def get_kagaku(fund_dict):
 # メイン処理
 # ==========================================
 
-# 1. 自動データ読み込み処理
 with st.sidebar:
-    st.header("⚙️ データ読み込み状況")
+    st.header("⚙️ データ読み込み")
     
     # 読み込み実行
     with st.spinner('GitHubからデータを取得中...'):
         load_success = load_remote_file('toshin_buy.xlsx')
 
     if load_success:
-        st.success("✅ toshin_buy.xlsx 取得成功")
+        st.success("✅ データ読み込み成功")
     else:
-        # ここで処理を停止させる
         st.stop()
 
     st.markdown("---")
