@@ -33,7 +33,8 @@
             "pyodide-http",
             "requests",
             "xlrd",
-            "pyyaml"
+            "pyyaml",
+            "pyarrow"  // 【重要】これを追加しました
           ],
           entrypoint: "streamlit_app.py",
           files: {
@@ -110,7 +111,7 @@ def load_remote_file(filename):
         return False
 
 # ==========================================
-# ロジック関数群 (変更なし)
+# ロジック関数群
 # ==========================================
 def get_growth(year, df_buy_hyouka):
     if datetime.date.today().year == year:
