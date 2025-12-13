@@ -10,6 +10,18 @@
   <body>
     <div id="root"></div>
     <script>
+      // 1. ここで現在のURL(フォルダまでのパス)を取得します
+      const href = window.location.href;
+      // index.html や #, ? を取り除いてベースURLを作る
+      var baseUrl = href.split('?')[0].split('#')[0];
+      if (baseUrl.toLowerCase().endsWith('index.html')) {
+          baseUrl = baseUrl.substring(0, baseUrl.lastIndexOf('/') + 1);
+      } else if (!baseUrl.endsWith('/')) {
+          baseUrl = baseUrl + '/';
+      }
+      
+      console.log("Base URL for Python:", baseUrl); // デバッグ用
+
       stlite.mount(
         {
           requirements: [
@@ -25,6 +37,9 @@
           ],
           entrypoint: "streamlit_app.py",
           files: {
+            // 2. PythonにベースURLを渡すためのファイルをここに定義
+            "base_url.txt": baseUrl,
+
             "streamlit_app.py": `
 import streamlit as st
 import sys
@@ -46,7 +61,6 @@ import io
 import requests
 import plotly.graph_objs as go
 import os
-import js # Javascript連携用
 from urllib.parse import urljoin
 
 # --- ネットワーク通信の有効化 ---
@@ -57,40 +71,28 @@ pyodide_http.patch_all()
 JST = datetime.timezone(timedelta(hours=+9), 'JST')
 
 # ==========================================
-# ファイル取得関数 (Worker対応版)
+# ファイル取得関数 (ベースURL読み込み版)
 # ==========================================
 def load_remote_file(filename):
     """
-    ブラウザの現在地から絶対URLを生成してファイルを取得する (Web Worker対応)
+    JSから渡された base_url.txt を使って絶対URLを生成し、ファイルを取得する
     """
     if os.path.exists(filename):
         return True
 
+    # 1. JS側から渡されたベースURLを読み込む
     try:
-        # 【修正】Worker環境では window ではなく location を直接参照する
-        current_location = str(js.location.href)
-    except Exception:
-        # 万が一取得できない場合は空文字
-        current_location = ""
+        with open("base_url.txt", "r") as f:
+            base_url = f.read().strip()
+    except FileNotFoundError:
+        st.error("❌ システムエラー: base_url.txt が見つかりません。")
+        return False
 
-    # ベースURLを整形 (index.html やパラメータを除去)
-    if "?" in current_location:
-        current_location = current_location.split("?")[0]
-    if "#" in current_location:
-        current_location = current_location.split("#")[0]
-    
-    if current_location.lower().endswith("index.html"):
-        base_url = current_location[:-10] # "index.html" を削除
-    elif not current_location.endswith("/"):
-        base_url = current_location + "/"
-    else:
-        base_url = current_location
-
-    # 完全なURLを作成 (例: https://user.github.io/repo/toshin_buy.xlsx)
+    # 2. 完全なURLを作成 (例: https://user.github.io/repo/toshin_buy.xlsx)
     target_url = urljoin(base_url, filename)
 
     try:
-        # st.write(f"取得先URL: {target_url}") # デバッグ用
+        # st.write(f"取得先URL: {target_url}") # デバッグ時はコメントアウト解除
         response = requests.get(target_url)
         
         if response.status_code == 200:
@@ -99,16 +101,16 @@ def load_remote_file(filename):
             return True
         else:
             st.error(f"❌ ファイルが見つかりません (Status: {response.status_code})")
-            st.error(f"参照先URL: {target_url}")
+            st.code(f"Target URL: {target_url}")
             return False
             
     except Exception as e:
         st.error(f"❌ 通信エラー: {e}")
-        st.write(f"Target URL: {target_url}")
+        st.code(f"Target URL: {target_url}")
         return False
 
 # ==========================================
-# ロジック関数群
+# ロジック関数群 (変更なし)
 # ==========================================
 def get_growth(year, df_buy_hyouka):
     if datetime.date.today().year == year:
