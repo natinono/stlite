@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <title>Stlite App</title>
+    <script src="https://cdn.jsdelivr.net/npm/@stlite/mountable@0.50.0/build/stlite.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      stlite.mount(
+        {
+          requirements: [
+            "streamlit",
+            "pandas",
+            "plotly",
+            "openpyxl",
+            "numpy",
+            "pyodide-http",
+            "requests",
+            "xlrd",
+            "pyyaml"  // 修正: これでエラーが出なくなります
+          ],
+          entrypoint: "streamlit_app.py",
+          files: {
+            "streamlit_app.py": `
+import streamlit as st
+import numpy
+import openpyxl
+import pandas
+import plotly
+import sys
+
+st.set_page_config(page_title="投資管理App", layout="wide")
+
+st.write("### 投資管理アプリ (Stlite版)")
+st.info("👈 左側のサイドバーにある **'投資履歴'** ページに移動して、Excelファイルをアップロードしてください。")
+
+st.markdown("""
+#### 使い方
+1. 左のサイドバーを開く
+2. **1_投資履歴** をクリック
+3. サイドバーの上部に表示される **'Browse files'** ボタンから **toshin_buy.xlsx** を選択
+""")
+
+st.write('---')
+st.caption(f'System Info: Python {sys.version} / Streamlit {st.__version__}')
+`,
+            "pages/1_投資履歴.py": `
+import pandas as pd
+import datetime
+from datetime import timedelta
+import streamlit as st
+import plotly.express as px
+from pandas.core.dtypes.inference import is_number
+import base64
+import yaml
+import io
+import requests
+import plotly.graph_objs as go
+
+# --- Stlite用のネットワークパッチ ---
+import pyodide_http
+pyodide_http.patch_all()
+# ---------------------------------
+
+JST = datetime.timezone(timedelta(hours=+9), 'JST')
+
+def get_growth(year, df_buy_hyouka):
+    if datetime.date.today().year == year:
+        end_date = datetime.date.today()
+    else:
+        end_date = datetime.date(year=year,month=12,day=31)
+    
+    end_date_str = end_date.strftime('%Y-%m-%d')
+    prev_end_date_str = datetime.date(year=(year-1),month=12,day=31).strftime('%Y-%m-%d')
+
+    # データが存在するかチェック
+    if end_date_str not in df_buy_hyouka.index:
+        if not df_buy_hyouka.empty:
+            # データ期間外なら最新の日付を使うなどの調整
+            if pd.to_datetime(end_date_str) > df_buy_hyouka.index[-1]:
+                 end_date_str = df_buy_hyouka.index[-1].strftime('%Y-%m-%d')
+            else:
+                 return 0,0,0,0,0
+        else:
+            return 0,0,0,0,0
+    
+    if prev_end_date_str not in df_buy_hyouka.index:
+         # 前年のデータがない場合
+         return 0,0,0,0,0
+
+    this_year_end_value = df_buy_hyouka['評価額'].loc[end_date_str]
+    previous_year_end_value = df_buy_hyouka['評価額'].loc[prev_end_date_str]
+    buy_this_year = df_buy_hyouka['購入額'].loc[end_date_str] - df_buy_hyouka['購入額'].loc[prev_end_date_str]
+    
+    profit = this_year_end_value - buy_this_year - previous_year_end_value
+    if previous_year_end_value != 0:
+        growth = profit / previous_year_end_value * 100
+    else:
+        growth = 0
+
+    this_year_end_value = int(this_year_end_value/10000)
+    previous_year_end_value = int(previous_year_end_value/10000)
+    buy_this_year = int(buy_this_year/10000)
+    profit = int(profit/10000)
+    growth = round(growth, 2)
+    return this_year_end_value , previous_year_end_value , buy_this_year , profit , growth
+
+@st.cache_data(ttl=600)
+def get_kagaku(fund_dict):
+    # emaxisから最新の基準価額を取得
+    kagaku_df = pd.DataFrame()
+    
+    for key, value in fund_dict.items():
+        try:
+            # 投信協会からDL
+            df = pd.read_csv(value, encoding='cp932', skiprows=0)
+            df = df.rename(columns={'年月日': '日付'})
+            df['日付'] = pd.to_datetime(df['日付'], format='%Y年%m月%d日')
+            df = df.set_index('日付')
+            df = df.iloc[:,0:1]
+
+            df.columns = [key]
+            kagaku_df = pd.concat([kagaku_df,df],axis=1)
+        except Exception as e:
+            pass
+
+    if not kagaku_df.empty:
+        kagaku_df = kagaku_df[kagaku_df.index >= '2019-01-01']
+
+    # 過去データ(xlsx)の読み込み
+    # kagaku.xlsx がない場合は、直近データのみで動くようにする
+    try:
+        kagaku_df_past = pd.read_excel('kagaku.xlsx')
+        kagaku_df_past = kagaku_df_past.set_index('日付',drop=True)
+        kagaku_df_past = kagaku_df_past[kagaku_df_past.index < '2019-01-01']
+        df_kagaku = pd.concat([kagaku_df_past,kagaku_df])
+    except Exception:
+        # ファイルがない、または読み込めない場合はWeb取得分のみ使用
+        df_kagaku = kagaku_df
+
+    return df_kagaku
+
+# ==========================================
+# メイン処理
+# ==========================================
+
+# 1. サイドバー設定 (最優先で配置)
+st.sidebar.header("📁 データ入力")
+uploaded_file = st.sidebar.file_uploader("toshin_buy.xlsx をアップロード", type=['xlsx'])
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ シミュレーション設定")
+
+predict_period = st.sidebar.slider("予測期間(年)", 0, 30, 0, 1)
+
+# 初期値設定
+kokunai_kongo      = 0
+senshinkoku_kongo  = 0
+balance_kongo      = 0
+zensekai_kongo     = 150000
+beikoku_kongo      = 0
+
+dict_growth = {
+    "国内株式"     : 5,
+    "先進国株式"   : 5,
+    "全世界株式"   : 5,
+    "米国株式"   : 5,
+    "バランス"   : 3,
+}
+
+st.sidebar.subheader("投資額設定")
+senshinkoku_kongo=st.sidebar.slider("投資額_先進国株式", 0, 40, int(senshinkoku_kongo/10000), 1)*10000
+zensekai_kongo=st.sidebar.slider("投資額_全世界株式", 0, 40, int(zensekai_kongo/10000), 1)*10000
+beikoku_kongo=st.sidebar.slider("投資額_米国株式", 0, 40, int(beikoku_kongo/10000), 1)*10000
+kokunai_kongo=st.sidebar.slider("投資額_国内株式", 0, 40, int(kokunai_kongo/10000), 1)*10000
+balance_kongo=st.sidebar.slider("投資額_バランス", 0, 40, int(balance_kongo/10000), 1)*10000
+
+st.sidebar.subheader("年利設定")
+dict_growth['先進国株式']=st.sidebar.slider("年利_先進国株式", 0, 20, dict_growth['先進国株式'], 1)
+dict_growth['全世界株式']=st.sidebar.slider("年利_全世界株式", 0, 20, dict_growth['全世界株式'], 1)
+dict_growth['米国株式']=st.sidebar.slider("年利_米国株式", 0, 20, dict_growth['米国株式'], 1)
+dict_growth['国内株式']=st.sidebar.slider("年利_国内株式", 0, 20, dict_growth['国内株式'], 1)
+dict_growth['バランス']=st.sidebar.slider("年利_バランス", 0, 20, dict_growth['バランス'], 1)
+
+
+# 2. ファイル読み込み処理
+buy_xlsx = None
+if uploaded_file is not None:
+    try:
+        buy_xlsx = pd.read_excel(uploaded_file)
+        st.sidebar.success("✅ ファイル読み込み成功")
+    except Exception as e:
+        st.error(f"ファイル読み込みエラー: {e}")
+        st.stop()
+else:
+    st.info("👈 左のサイドバーから 'toshin_buy.xlsx' をアップロードしてください。")
+    st.stop() # ファイルがない場合はここで処理を止める
+
+# 3. データの取得と計算
+str_date = "2017-01-01"
+future_date = str(datetime.date.today() + datetime.timedelta(days=365*predict_period))
+today = datetime.datetime.today()
+
+fund_dict = {
+'国内株式':   'https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download?isinCd=JP90C000FXV1&associFundCd=03311182',
+'先進国株式': 'https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download?isinCd=JP90C000ENC5&associFundCd=03319172',
+'全世界株式': 'https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download?isinCd=JP90C000H1T1&associFundCd=0331418A',
+'米国株式':   'https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download?isinCd=JP90C000GKC6&associFundCd=03311187',
+'バランス':   'https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download?isinCd=JP90C000EWV6&associFundCd=03312175',
+}
+
+with st.spinner('最新の基準価額を取得中...'):
+    df_kagaku = get_kagaku(fund_dict)
+
+if df_kagaku.empty:
+    st.error("基準価額データが取得できませんでした。ネットワーク環境またはCORS制限を確認してください。")
+    st.stop()
+
+leatest_date = df_kagaku.index.max()
+
+date_index = pd.date_range("2017-01-04",end=str(datetime.datetime.today()) ,freq="D")
+df_new = pd.DataFrame(index=date_index)
+df_new=df_new.rename_axis('日付')
+df_kagaku = pd.merge_asof(df_new, df_kagaku, on='日付',direction='backward')
+df_kagaku = df_kagaku.set_index('日付', drop=True)
+
+df_mirai = pd.DataFrame(index = pd.date_range(df_kagaku.index[len(df_kagaku)-1], future_date , freq='MS'),columns= df_kagaku.columns)
+df_kagaku = pd.concat([df_kagaku,df_mirai]).groupby(level=0).last()
+
+# 将来予測の計算
+for i in range(0,len(df_kagaku)):
+    val = float(df_kagaku.iloc[i]['国内株式']) if pd.notna(df_kagaku.iloc[i]['国内株式']) else -1.0
+    if val >= 0.0:
+        pass
+    else:
+        for k, v in dict_growth.items():
+            prev_val = df_kagaku.iloc[i-1][k]
+            if pd.isna(prev_val): prev_val = 0
+            days = (df_kagaku.index[i]-df_kagaku.index[i-1]).days
+            df_kagaku.iloc[i,df_kagaku.columns.get_loc(k)] = prev_val * (1+v/100) ** (1/365*days)
+
+df_kagaku_hiritu = df_kagaku.copy()
+base_date = "2017-12-29"
+if base_date in df_kagaku_hiritu.index:
+     df_kagaku_hiritu = df_kagaku_hiritu / df_kagaku_hiritu.loc[base_date] * 100
+else:
+     if not df_kagaku_hiritu.empty:
+        df_kagaku_hiritu = df_kagaku_hiritu / df_kagaku_hiritu.iloc[0] * 100
+
+# 4. 購入履歴データの結合処理
+df_buy = pd.DataFrame()
+if buy_xlsx is not None and not buy_xlsx.empty:
+    for index, data in buy_xlsx.iterrows():
+        # データ型変換や欠損値処理
+        if '年月日' in data and 'アセット' in data and '価格' in data:
+            target_date = data['年月日']
+            target_asset = data['アセット']
+            price = data['価格']
+            
+            if pd.isna(target_date) or pd.isna(target_asset):
+                continue
+
+            if target_date not in df_buy.index or target_asset not in df_buy.columns:
+                df_buy.loc[target_date, target_asset] = price
+            else:
+                df_buy.loc[target_date, target_asset] += price
+
+    df_buy=df_buy.rename_axis('年月日')
+    df_buy = df_buy.sort_index()
+    
+    df_buy.index = pd.to_datetime(df_buy.index)
+
+    # 将来分の積立設定
+    future_mask = df_buy.index >= today
+    if future_mask.any():
+        first_row_index = df_buy.index[future_mask][0]
+        loc_idx = df_buy.index.get_loc(first_row_index)
+        if isinstance(loc_idx, slice):
+            loc_idx = loc_idx.start
+        
+        cols = ['国内株式', '先進国株式', 'バランス', '全世界株式', '米国株式']
+        for col in cols:
+            if col not in df_buy.columns:
+                df_buy[col] = 0
+
+        if not df_buy.empty:
+            if '国内株式' in df_buy.columns: df_buy.iloc[loc_idx:, df_buy.columns.get_loc('国内株式')] = kokunai_kongo
+            if '先進国株式' in df_buy.columns: df_buy.iloc[loc_idx:, df_buy.columns.get_loc('先進国株式')] = senshinkoku_kongo
+            if 'バランス' in df_buy.columns: df_buy.iloc[loc_idx:, df_buy.columns.get_loc('バランス')] = balance_kongo
+            if '全世界株式' in df_buy.columns: df_buy.iloc[loc_idx:, df_buy.columns.get_loc('全世界株式')] = zensekai_kongo
+            if '米国株式' in df_buy.columns: df_buy.iloc[loc_idx:, df_buy.columns.get_loc('米国株式')] = beikoku_kongo
+
+    df_buy = df_buy[(df_buy.index < today) | (df_buy.index.day == 1)]
+
+    # 評価額計算
+    df_kagaku_hiritu = df_kagaku_hiritu.replace(0,1.0e-10)
+    df_kuchisu = (df_buy / df_kagaku_hiritu).fillna(0)
+    df_hyouka = df_kagaku_hiritu * df_kuchisu.cumsum() 
+
+    date_index = df_hyouka.index
+    df_new = pd.DataFrame(index=date_index)
+    df_new=df_new.rename_axis('日付')
+    df_buy2 = pd.concat([df_new, df_buy],axis=1,join='outer')
+
+    df_buy_hyouka = pd.concat([df_buy2.fillna(0).cumsum().sum(axis=1),df_hyouka.sum(axis=1)],axis=1)
+    df_buy_hyouka.columns = ['購入額','評価額']
+    df_buy_hyouka['税引き前利益'] = df_buy_hyouka['評価額'] - df_buy_hyouka['購入額']
+    df_buy_hyouka['税引き後利益'] = df_buy_hyouka['税引き前利益'] * 0.8
+
+    # 表示用関数
+    def date_judge(date):
+        today_now = datetime.datetime.now()
+        delta_days = (today_now - date).days
+        if delta_days == 0:
+            return '今日'
+        else:
+            return (str(delta_days)+'日前')
+
+    st.write("### 投資状況サマリ")
+    
+    if leatest_date in df_buy_hyouka.index:
+        try:
+            display_table = pd.DataFrame({
+            '最新基準価額':[leatest_date.strftime('%Y/%m/%d') +  ' (' + date_judge(leatest_date) + ')'],
+            '評価額':["{:.2f}".format(int(df_buy_hyouka['評価額'][leatest_date]/10000)/100) + 'M'],
+            '総利益':["{:+.2f}".format(int(df_buy_hyouka['税引き前利益'][leatest_date]/10000)/100) + 'M'],
+            }).set_index('最新基準価額')
+            st.table(display_table)
+        except Exception:
+            st.warning("最新日付のデータ計算中にエラーが発生しました。")
+
+        # グラフ描画
+        margin = dict(t=30, b=20, l=20, r=20)
+        
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            display_month = st.slider("グラフ表示期間(月)", 0, 60, 12, 1)
+        
+        str_date2 = datetime.datetime.today() - timedelta(days=display_month*30)
+
+        fig4 = px.line(df_buy_hyouka[str_date2 : today]['評価額'],title='直近の評価額推移')
+        fig4.update_layout(margin=margin, width=800, height=400)
+        st.plotly_chart(fig4, use_container_width=True)
+
+        df_buy_hyouka_cut = df_buy_hyouka[str_date : future_date].astype(float)
+        fig3 = px.line(df_buy_hyouka_cut,title='損益推移')
+        fig3.update_layout(margin=margin, width=800, height=400)
+        st.plotly_chart(fig3, use_container_width=True)
+
+        df_hyouka = df_hyouka.astype(float)
+        df_hyouka = df_hyouka[str_date : future_date]
+        fig2 = px.area(df_hyouka,title='アセット別評価額')
+        fig2.update_layout(margin=margin, width=800, height=400)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # 月次利益
+        monthly_profit = df_buy_hyouka.groupby(pd.Grouper(freq='M'))['税引き後利益'].agg('last')
+        shifted_monthly_profit = monthly_profit.shift(1)
+        monthly_profit_diff = monthly_profit - shifted_monthly_profit
+        monthly_profit_diff_df = pd.DataFrame(monthly_profit_diff)
+        monthly_profit_diff_df['税引き後利益'] = (monthly_profit_diff_df['税引き後利益']/10000)
+        monthly_profit_diff_df = monthly_profit_diff_df.dropna(subset=['税引き後利益'])
+        monthly_profit_diff_df['税引き後利益'] = monthly_profit_diff_df['税引き後利益'].astype(int)
+
+        monthly_profit_diff_df["12カ月移動平均"] = monthly_profit_diff_df["税引き後利益"].rolling(12).mean()
+        monthly_profit_diff_df["24カ月移動平均"] = monthly_profit_diff_df["税引き後利益"].rolling(24).mean()
+        monthly_profit_diff_df["36カ月移動平均"] = monthly_profit_diff_df["税引き後利益"].rolling(36).mean()
+
+        trace1=go.Bar(x=monthly_profit_diff_df.index, y=monthly_profit_diff_df['税引き後利益'],text=monthly_profit_diff_df['税引き後利益'],name='月次', yaxis='y1',marker_color='#808080')
+        trace2=go.Scatter(x=monthly_profit_diff_df.index, y=monthly_profit_diff_df['12カ月移動平均'],text=monthly_profit_diff_df['12カ月移動平均'],name='12カ月移動平均', yaxis='y1',line=dict(color="#00008b"))
+        trace3=go.Scatter(x=monthly_profit_diff_df.index, y=monthly_profit_diff_df['24カ月移動平均'],text=monthly_profit_diff_df['24カ月移動平均'],name='24カ月移動平均', yaxis='y1',line=dict(color="#006400"))
+        
+        layout = go.Layout(
+            title='月次利益(税引き後)',
+            xaxis = dict(title = '日付', showgrid=False,dtick='M12'), 
+            yaxis = dict(title = '万円', side = 'left',dtick=50), 
+        )
+
+        fig6= go.Figure(data = [trace1,trace2,trace3],layout=layout)
+        st.plotly_chart(fig6, use_container_width=True)
+
+        # 年利計算
+        year_list = []
+        this_year_end_value_list = []
+        previous_year_end_value_list = []
+        buy_this_year_list = []
+        profit_list = []
+        growth_list = []
+
+        for year in range(2018,(datetime.date.today().year+1)):
+            this_year_end_value , previous_year_end_value , buy_this_year , profit , growth = get_growth(year, df_buy_hyouka)
+            if this_year_end_value != 0 or previous_year_end_value != 0:
+                year_list.append(year)
+                this_year_end_value_list.append(this_year_end_value)
+                previous_year_end_value_list.append(previous_year_end_value)
+                profit_list.append(profit)
+                buy_this_year_list.append(buy_this_year)
+                growth_list.append(growth)
+        
+        if year_list:
+            growth_df = pd.DataFrame(list(zip(year_list,previous_year_end_value_list,this_year_end_value_list,buy_this_year_list,profit_list,growth_list)),columns = ['年','年始評価額','年末評価額','購入額','利益','年利(%)'])
+            growth_df = growth_df.set_index('年')
+            st.dataframe(growth_df)
+`,
+          },
+        },
+        document.getElementById("root")
+      );
+    </script>
+  </body>
+</html>
