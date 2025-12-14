@@ -16,7 +16,6 @@
             "streamlit",
             "pandas",
             "matplotlib",
-            "japanize-matplotlib",
             "streamlit-autorefresh",
             "pyodide-http",
             "requests"
@@ -31,14 +30,41 @@ import datetime
 import pytz
 import requests
 import matplotlib.pyplot as plt
-import japanize_matplotlib
+import matplotlib.font_manager as fm
 from streamlit_autorefresh import st_autorefresh
 import pyodide_http
+import os
 
 # ブラウザでrequestsを使えるようにパッチを適用
 pyodide_http.patch_all()
 
-# Ambientライブラリの代わりとなるクラスを定義（インストールエラー回避のため）
+# --- 日本語フォント設定 (japanize-matplotlibの代用) ---
+def configure_japanese_font():
+    font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"
+    font_path = "NotoSansCJKjp-Regular.otf"
+    
+    # フォントファイルがなければダウンロード
+    if not os.path.exists(font_path):
+        try:
+            response = requests.get(font_url)
+            response.raise_for_status()
+            with open(font_path, "wb") as f:
+                f.write(response.content)
+        except Exception as e:
+            st.warning(f"日本語フォントのダウンロードに失敗しました: {e}")
+            return
+
+    # フォントをMatplotlibに登録
+    try:
+        fm.fontManager.addfont(font_path)
+        plt.rcParams['font.family'] = 'Noto Sans CJK JP'
+    except Exception as e:
+        st.warning(f"フォントの設定に失敗しました: {e}")
+
+configure_japanese_font()
+# -------------------------------------------------------
+
+# Ambientライブラリの代わりとなるクラス
 class Ambient:
     def __init__(self, channelId, writeKey=None, readKey=None, userKey=None):
         self.channelId = channelId
@@ -61,12 +87,9 @@ count = st_autorefresh(interval=60000, limit=100, key="fizzbuzzcounter")
 
 # 日付パース関数
 def parse_date(x):
-    # 文字列のフォーマットに合わせて調整
-    # Ambientの形式: YYYY-MM-DDTHH:MM:SS.sssZ
     try:
         t = datetime.datetime.strptime(x, '%Y-%m-%dT%H:%M:%S.%fZ')
     except ValueError:
-        # マイクロ秒がない場合などの予備
         t = datetime.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ')
     return pytz.utc.localize(t).astimezone(pytz.timezone('Asia/Tokyo'))
 
@@ -80,58 +103,44 @@ with col2:
         st.rerun()
 
 try:
-    # 自作クラスを使用
     am = Ambient(66341, '', '91fe241f20d21b0e')
-    
-    # データ取得
     d = am.read(n=int(days * (24 * 60)))
     df = pd.DataFrame(d)
 
     if df.empty:
         st.error("データが取得できませんでした。(空のデータ)")
     else:
-        # 列操作
         created = df.pop('created')
         df.insert(0, '日時', created)
         df['日時'] = df['日時'].apply(parse_date)
         df = df.set_index('日時')
 
-        # カラム名の変更処理
         if len(df.columns) == 4:
             df.columns = ['温度','湿度','明るさ','電力']
         elif len(df.columns) == 5:
             df.columns = ['温度','湿度','明るさ','電力','横浜']
         else:
-            # カラム数が合わない場合の安全策（先頭から割り当て）
             cols = ['温度','湿度','明るさ','電力','横浜','PC起動','電力料金']
             df.columns = cols[:len(df.columns)]
 
-        # 数値型に変換（エラー回避のため）
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # 不快指数計算
         df['不快指数'] = 0.81 * df['温度'] + 0.01 * df['湿度'] * (0.99 * df['温度'] - 14.3 ) + 46.3
 
-        # 電力計算
         df['電力_'] = df['電力'] * (1/60)
         df['積算電力'] = df.groupby(df.index.date)['電力_'].cumsum()
         df['電気料金'] = df['積算電力'] / 1000 * 31
 
-        # 最新データの表示
         latest = df.iloc[-1]
-        
-        # '横浜'カラムが存在するか確認してから表示
         yokohama_temp = latest['横浜'] if '横浜' in df.columns else '-'
         
         st.write(f"### {df.index[-1].strftime('%m/%d %H:%M')}　外気温{yokohama_temp}℃　室温{latest['温度']}℃　不快指数{int(latest['不快指数'])}")
 
-        # グラフ描画
         fig, (ax1, ax2) = plt.subplots(2, sharex=True, gridspec_kw={'height_ratios': [2, 1], 'hspace': 0}, figsize=(9, 9))
         ax1b = ax1.twinx()
         ax2b = ax2.twinx()
 
-        # プロット（存在確認しつつ）
         if '湿度' in df.columns: df['湿度'].plot(ax=ax1, color='lightblue', label='湿度')
         if '不快指数' in df.columns: df['不快指数'].plot(ax=ax1, color='orange', label='不快指数')
         if '横浜' in df.columns: df['横浜'].plot(ax=ax1b, linestyle='--', label='横浜')
@@ -151,7 +160,6 @@ try:
         ax2.grid(False); ax2b.grid(True)
         ax1.xaxis.grid(True); ax2.xaxis.grid(True)
 
-        # 凡例
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines1b, labels1b = ax1b.get_legend_handles_labels()
         ax1.legend(lines1 + lines1b, labels1 + labels1b, loc='upper left')
@@ -166,7 +174,6 @@ try:
 except Exception as e:
     st.error(f"エラーが発生しました: {e}")
     st.write("詳細:", e)
-
 `
           }
         },
