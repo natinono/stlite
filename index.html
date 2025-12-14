@@ -18,7 +18,6 @@
             "matplotlib",
             "japanize-matplotlib",
             "streamlit-autorefresh",
-            "git+https://github.com/AmbientDataInc/ambient-python-lib.git", 
             "pyodide-http",
             "requests"
           ],
@@ -30,7 +29,7 @@ import pandas as pd
 import numpy as np
 import datetime
 import pytz
-import ambient
+import requests
 import matplotlib.pyplot as plt
 import japanize_matplotlib
 from streamlit_autorefresh import st_autorefresh
@@ -39,107 +38,134 @@ import pyodide_http
 # ブラウザでrequestsを使えるようにパッチを適用
 pyodide_http.patch_all()
 
-# Run the autorefresh about every 2000 milliseconds (2 seconds) and stop
-# after it's been refreshed 100 times.
+# Ambientライブラリの代わりとなるクラスを定義（インストールエラー回避のため）
+class Ambient:
+    def __init__(self, channelId, writeKey=None, readKey=None, userKey=None):
+        self.channelId = channelId
+        self.readKey = readKey
+    
+    def read(self, n=None):
+        url = f"https://ambidata.io/api/v2/channels/{self.channelId}/data"
+        params = {}
+        if self.readKey:
+            params['readKey'] = self.readKey
+        if n:
+            params['n'] = n
+        
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+
+# 自動リフレッシュ設定
 count = st_autorefresh(interval=60000, limit=100, key="fizzbuzzcounter")
 
-# 次にデーターをpandasのDataFrameに変換します。
+# 日付パース関数
 def parse_date(x):
-    t = datetime.datetime.strptime(x, '%Y-%m-%dT%H:%M:%S.%fZ')
+    # 文字列のフォーマットに合わせて調整
+    # Ambientの形式: YYYY-MM-DDTHH:MM:SS.sssZ
+    try:
+        t = datetime.datetime.strptime(x, '%Y-%m-%dT%H:%M:%S.%fZ')
+    except ValueError:
+        # マイクロ秒がない場合などの予備
+        t = datetime.datetime.strptime(x, '%Y-%m-%dT%H:%M:%SZ')
     return pytz.utc.localize(t).astimezone(pytz.timezone('Asia/Tokyo'))
 
 col1, col2 = st.columns(2)
 
 with col1:
-    days=st.number_input('表示する日数',1,30,1,step=1)
+    days = st.number_input('表示する日数', 1, 30, 1, step=1)
 
 with col2:
     if st.button('リロード'):
-        st.rerun() # st.experimental_rerun is deprecated
+        st.rerun()
 
 try:
-    am = ambient.Ambient(66341,'','91fe241f20d21b0e')
-    d = am.read(n=int(days*(24*60)))
+    # 自作クラスを使用
+    am = Ambient(66341, '', '91fe241f20d21b0e')
+    
+    # データ取得
+    d = am.read(n=int(days * (24 * 60)))
     df = pd.DataFrame(d)
 
-    # データが空の場合のエラーハンドリング
     if df.empty:
-        st.error("データの取得に失敗しました。CORS制限またはデータが存在しない可能性があります。")
+        st.error("データが取得できませんでした。(空のデータ)")
     else:
-        # 列を移動
+        # 列操作
         created = df.pop('created')
-        # 2番目の位置に 'img' 列を挿入
         df.insert(0, '日時', created)
         df['日時'] = df['日時'].apply(parse_date)
         df = df.set_index('日時')
 
+        # カラム名の変更処理
         if len(df.columns) == 4:
             df.columns = ['温度','湿度','明るさ','電力']
         elif len(df.columns) == 5:
             df.columns = ['温度','湿度','明るさ','電力','横浜']
         else:
-            df.columns = ['温度','湿度','明るさ','電力','横浜','PC起動','電力料金']
+            # カラム数が合わない場合の安全策（先頭から割り当て）
+            cols = ['温度','湿度','明るさ','電力','横浜','PC起動','電力料金']
+            df.columns = cols[:len(df.columns)]
 
+        # 数値型に変換（エラー回避のため）
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        # 不快指数計算
         df['不快指数'] = 0.81 * df['温度'] + 0.01 * df['湿度'] * (0.99 * df['温度'] - 14.3 ) + 46.3
 
-        # 電力消費量をワットアワーに変換
+        # 電力計算
         df['電力_'] = df['電力'] * (1/60)
-        # 日ごとにグループ化し、それぞれのグループで累積合計を計算
         df['積算電力'] = df.groupby(df.index.date)['電力_'].cumsum()
-        # kWhに変換し、価格を乗じて電気使用量を求める
         df['電気料金'] = df['積算電力'] / 1000 * 31
 
-        st.write('### ' + df.index[-1].strftime('%m/%d %H:%M') + '　外気温' + str(df.iloc[-1,:]['横浜']) + '℃　室温' + str(df.iloc[-1,:]['温度']) + '℃　不快指数' + str(int(df.iloc[-1,:]['不快指数'])))
+        # 最新データの表示
+        latest = df.iloc[-1]
+        
+        # '横浜'カラムが存在するか確認してから表示
+        yokohama_temp = latest['横浜'] if '横浜' in df.columns else '-'
+        
+        st.write(f"### {df.index[-1].strftime('%m/%d %H:%M')}　外気温{yokohama_temp}℃　室温{latest['温度']}℃　不快指数{int(latest['不快指数'])}")
 
-        # フィギュアのサイズとサブプロット間の間隔を指定
+        # グラフ描画
         fig, (ax1, ax2) = plt.subplots(2, sharex=True, gridspec_kw={'height_ratios': [2, 1], 'hspace': 0}, figsize=(9, 9))
-
-        # Secondary axes for the plots
         ax1b = ax1.twinx()
         ax2b = ax2.twinx()
 
-        # データのプロット
-        df['湿度'].plot(ax=ax1, color='lightblue', label='湿度')
-        df['不快指数'].plot(ax=ax1, color='orange', label='不快指数')
-        df['横浜'].plot(ax=ax1b, linestyle='--', label='横浜')
-        df['温度'].plot(ax=ax1b, color='red', label='室温')
-        df['電力'].plot(ax=ax2b, color='orange', label='電力')
-        df['明るさ'].plot(ax=ax2, color='green', label='明るさ')
-        df['PC起動'].plot(ax=ax2, color='blue', label='PC起動')
-        df['電気料金'].plot(ax=ax2, color='red', label='電気料金')
+        # プロット（存在確認しつつ）
+        if '湿度' in df.columns: df['湿度'].plot(ax=ax1, color='lightblue', label='湿度')
+        if '不快指数' in df.columns: df['不快指数'].plot(ax=ax1, color='orange', label='不快指数')
+        if '横浜' in df.columns: df['横浜'].plot(ax=ax1b, linestyle='--', label='横浜')
+        if '温度' in df.columns: df['温度'].plot(ax=ax1b, color='red', label='室温')
+        
+        if '電力' in df.columns: df['電力'].plot(ax=ax2b, color='orange', label='電力')
+        if '明るさ' in df.columns: df['明るさ'].plot(ax=ax2, color='green', label='明るさ')
+        if 'PC起動' in df.columns: df['PC起動'].plot(ax=ax2, color='blue', label='PC起動')
+        if '電気料金' in df.columns: df['電気料金'].plot(ax=ax2, color='red', label='電気料金')
 
-        # 軸ラベルの設定
         ax1.set_ylabel('湿度/不快指数')
         ax1b.set_ylabel('温度')
-        ax2.set_ylabel('PC起動/明るさ/電気料金')
+        ax2.set_ylabel('PC/明るさ/料金')
         ax2b.set_ylabel('電力')
 
-        # Add grid lines to the right y-axes and x-axes
-        ax1.grid(False)  # Turn off grid for left y-axis
-        ax1b.grid(True)  # Turn on grid for right y-axis
-        ax2.grid(False)  # Turn off grid for left y-axis
-        ax2b.grid(True)  # Turn on grid for right y-axis
+        ax1.grid(False); ax1b.grid(True)
+        ax2.grid(False); ax2b.grid(True)
+        ax1.xaxis.grid(True); ax2.xaxis.grid(True)
 
-        # Add grid for x-axis
-        ax1.xaxis.grid(True)
-        ax2.xaxis.grid(True)
+        # 凡例
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines1b, labels1b = ax1b.get_legend_handles_labels()
+        ax1.legend(lines1 + lines1b, labels1 + labels1b, loc='upper left')
 
-        # 凡例の設定
-        lines, labels = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax1b.get_legend_handles_labels()
-        ax1.legend(lines + lines2, labels + labels2, loc='upper left')
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        lines2b, labels2b = ax2b.get_legend_handles_labels()
+        ax2.legend(lines2 + lines2b, labels2 + labels2b, loc='upper left')
 
-        lines, labels = ax2.get_legend_handles_labels()
-        lines2, labels2 = ax2b.get_legend_handles_labels()
-        ax2.legend(lines + lines2, labels + labels2, loc='upper left')
-
-        st.pyplot(fig)  # Streamlitでmatplotlibのグラフを表示
-
+        st.pyplot(fig)
         st.image('https://storage.tenki.jp/storage/static-images/forecaster_diary/image/4/48/482/4828/a/20190604091250/large.jpg', width=250)
 
 except Exception as e:
     st.error(f"エラーが発生しました: {e}")
-    st.info("ブラウザからのアクセスがブロックされている(CORS)か、ネットワークエラーの可能性があります。")
+    st.write("詳細:", e)
 
 `
           }
