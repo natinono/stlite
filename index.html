@@ -38,33 +38,35 @@ import os
 # ブラウザでrequestsを使えるようにパッチを適用
 pyodide_http.patch_all()
 
-# --- 日本語フォント設定 (japanize-matplotlibの代用) ---
+# --- 日本語フォント設定 (CORS対応版URL) ---
 def configure_japanese_font():
-    font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"
+    # 以前のURLはリダイレクトによりCORSエラーになるため、raw.githubusercontent.comを使用
+    # ファイルサイズが大きいため、TakaoPゴシックなどの軽量フォントを使用するのも手ですが、
+    # ここではGoogle FontsのRawリンクを使用します。
+    font_url = "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"
     font_path = "NotoSansCJKjp-Regular.otf"
     
-    # フォントファイルがなければダウンロード
     if not os.path.exists(font_path):
         try:
-            response = requests.get(font_url)
-            response.raise_for_status()
-            with open(font_path, "wb") as f:
-                f.write(response.content)
+            with st.spinner("日本語フォントをダウンロード中..."):
+                response = requests.get(font_url)
+                response.raise_for_status()
+                with open(font_path, "wb") as f:
+                    f.write(response.content)
         except Exception as e:
-            st.warning(f"日本語フォントのダウンロードに失敗しました: {e}")
+            st.error(f"フォントダウンロードエラー: {e}")
             return
 
-    # フォントをMatplotlibに登録
     try:
         fm.fontManager.addfont(font_path)
         plt.rcParams['font.family'] = 'Noto Sans CJK JP'
     except Exception as e:
-        st.warning(f"フォントの設定に失敗しました: {e}")
+        st.warning(f"フォント設定エラー: {e}")
 
 configure_japanese_font()
 # -------------------------------------------------------
 
-# Ambientライブラリの代わりとなるクラス
+# Ambientクラス
 class Ambient:
     def __init__(self, channelId, writeKey=None, readKey=None, userKey=None):
         self.channelId = channelId
@@ -82,10 +84,9 @@ class Ambient:
         response.raise_for_status()
         return response.json()
 
-# 自動リフレッシュ設定
+# 自動リフレッシュ
 count = st_autorefresh(interval=60000, limit=100, key="fizzbuzzcounter")
 
-# 日付パース関数
 def parse_date(x):
     try:
         t = datetime.datetime.strptime(x, '%Y-%m-%dT%H:%M:%S.%fZ')
@@ -115,27 +116,35 @@ try:
         df['日時'] = df['日時'].apply(parse_date)
         df = df.set_index('日時')
 
-        if len(df.columns) == 4:
-            df.columns = ['温度','湿度','明るさ','電力']
-        elif len(df.columns) == 5:
-            df.columns = ['温度','湿度','明るさ','電力','横浜']
+        # カラム名のマッピング調整
+        cols_map = ['温度','湿度','明るさ','電力','横浜','PC起動','電力料金']
+        current_cols = len(df.columns)
+        if current_cols <= len(cols_map):
+            df.columns = cols_map[:current_cols]
         else:
-            cols = ['温度','湿度','明るさ','電力','横浜','PC起動','電力料金']
-            df.columns = cols[:len(df.columns)]
+             df.columns = [f"Col{i}" for i in range(current_cols)] # フォールバック
 
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        df['不快指数'] = 0.81 * df['温度'] + 0.01 * df['湿度'] * (0.99 * df['温度'] - 14.3 ) + 46.3
+        if '温度' in df.columns and '湿度' in df.columns:
+            df['不快指数'] = 0.81 * df['温度'] + 0.01 * df['湿度'] * (0.99 * df['温度'] - 14.3 ) + 46.3
+        else:
+            df['不快指数'] = np.nan
 
-        df['電力_'] = df['電力'] * (1/60)
-        df['積算電力'] = df.groupby(df.index.date)['電力_'].cumsum()
-        df['電気料金'] = df['積算電力'] / 1000 * 31
+        if '電力' in df.columns:
+            df['電力_'] = df['電力'] * (1/60)
+            df['積算電力'] = df.groupby(df.index.date)['電力_'].cumsum()
+            df['電気料金'] = df['積算電力'] / 1000 * 31
 
         latest = df.iloc[-1]
-        yokohama_temp = latest['横浜'] if '横浜' in df.columns else '-'
         
-        st.write(f"### {df.index[-1].strftime('%m/%d %H:%M')}　外気温{yokohama_temp}℃　室温{latest['温度']}℃　不快指数{int(latest['不快指数'])}")
+        # 表示用変数の準備（存在確認付き）
+        val_yokohama = latest['横浜'] if '横浜' in df.columns else '-'
+        val_temp = latest['温度'] if '温度' in df.columns else '-'
+        val_di = int(latest['不快指数']) if '不快指数' in df.columns and not pd.isna(latest['不快指数']) else '-'
+        
+        st.write(f"### {df.index[-1].strftime('%m/%d %H:%M')}　外気温{val_yokohama}℃　室温{val_temp}℃　不快指数{val_di}")
 
         fig, (ax1, ax2) = plt.subplots(2, sharex=True, gridspec_kw={'height_ratios': [2, 1], 'hspace': 0}, figsize=(9, 9))
         ax1b = ax1.twinx()
@@ -162,11 +171,13 @@ try:
 
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines1b, labels1b = ax1b.get_legend_handles_labels()
-        ax1.legend(lines1 + lines1b, labels1 + labels1b, loc='upper left')
+        if lines1 or lines1b:
+            ax1.legend(lines1 + lines1b, labels1 + labels1b, loc='upper left')
 
         lines2, labels2 = ax2.get_legend_handles_labels()
         lines2b, labels2b = ax2b.get_legend_handles_labels()
-        ax2.legend(lines2 + lines2b, labels2 + labels2b, loc='upper left')
+        if lines2 or lines2b:
+            ax2.legend(lines2 + lines2b, labels2 + labels2b, loc='upper left')
 
         st.pyplot(fig)
         st.image('https://storage.tenki.jp/storage/static-images/forecaster_diary/image/4/48/482/4828/a/20190604091250/large.jpg', width=250)
